@@ -350,6 +350,105 @@ impl SingleModuleGraph {
 
         Ok(())
     }
+
+    /// Traverses all reachable edges in topological order. The preorder visitor can be used to
+    /// forward state down the graph, and to skip subgraphs
+    ///
+    /// Use this to collect modules in evaluation order.
+    ///
+    /// Target nodes can be revisited (once per incoming edge).
+    /// Edges are traversed in normal order, so should correspond to reference order.
+    ///
+    /// * `entry` - The entry module to start the traversal from
+    /// * `state` - The state to be passed to the visitors
+    /// * `visit_preorder` - Called before visiting the children of a node.
+    ///    - Receives: (originating &SingleModuleGraphNode, edge &ChunkingType), target
+    ///      &SingleModuleGraphNode, state &S
+    ///    - Can return [GraphTraversalAction]s to control the traversal
+    /// * `visit_postorder` - Called after visiting the children of a node. Return
+    ///    - Receives: (originating &SingleModuleGraphNode, edge &ChunkingType), target
+    ///      &SingleModuleGraphNode, state &S
+    ///    - Can return [GraphTraversalAction]s to control the traversal
+    pub async fn traverse_edges_from_entry_topological_async<'a, S>(
+        &'a self,
+        entry: ResolvedVc<Box<dyn Module>>,
+        state: &mut S,
+        mut visit_preorder: impl AsyncFnMut(
+            Option<(&'a SingleModuleGraphNode, &'a ChunkingType)>,
+            &'a SingleModuleGraphNode,
+            &mut S,
+        ) -> Result<GraphTraversalAction>,
+        mut visit_postorder: impl FnMut(
+            Option<(&'a SingleModuleGraphNode, &'a ChunkingType)>,
+            &'a SingleModuleGraphNode,
+            &mut S,
+        ),
+    ) -> Result<()> {
+        let graph = &self.graph;
+        let entry_node = self.get_entry(entry)?;
+
+        enum ReverseTopologicalPass {
+            Visit,
+            ExpandAndVisit,
+        }
+
+        #[allow(clippy::type_complexity)] // This is a temporary internal structure
+        let mut stack: Vec<(
+            ReverseTopologicalPass,
+            Option<(NodeIndex, EdgeIndex)>,
+            NodeIndex,
+        )> = vec![(ReverseTopologicalPass::ExpandAndVisit, None, entry_node)];
+        let mut expanded = HashSet::new();
+        while let Some((pass, parent, current)) = stack.pop() {
+            match pass {
+                ReverseTopologicalPass::Visit => {
+                    visit_postorder(
+                        parent.map(|parent| {
+                            (
+                                graph.node_weight(parent.0).unwrap(),
+                                graph.edge_weight(parent.1).unwrap(),
+                            )
+                        }),
+                        graph.node_weight(current).unwrap(),
+                        state,
+                    );
+                }
+                ReverseTopologicalPass::ExpandAndVisit => {
+                    let action = visit_preorder(
+                        parent.map(|parent| {
+                            (
+                                graph.node_weight(parent.0).unwrap(),
+                                graph.edge_weight(parent.1).unwrap(),
+                            )
+                        }),
+                        graph.node_weight(current).unwrap(),
+                        state,
+                    )
+                    .await?;
+                    stack.push((ReverseTopologicalPass::Visit, parent, current));
+                    if expanded.insert(current) && action == GraphTraversalAction::Continue {
+                        let mut walker = graph.neighbors(current).detach();
+                        let neighbors = {
+                            let mut neighbors = vec![];
+                            while let Some((e, n)) = walker.next(graph) {
+                                neighbors.push((e, n));
+                            }
+                            neighbors
+                        };
+                        stack.extend(neighbors.iter().map(|(edge, child)| {
+                            (
+                                ReverseTopologicalPass::ExpandAndVisit,
+                                Some((current, *edge)),
+                                *child,
+                            )
+                        }));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[turbo_tasks::value_impl]
