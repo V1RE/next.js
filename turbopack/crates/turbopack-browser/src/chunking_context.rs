@@ -8,7 +8,7 @@ use turbopack_core::{
         availability_info::AvailabilityInfo,
         chunk_group::{make_chunk_group, MakeChunkGroupResult},
         module_id_strategies::{DevModuleIdStrategy, ModuleIdStrategy},
-        Chunk, ChunkGroupResult, ChunkItem, ChunkableModule, ChunkingContext,
+        Chunk, ChunkGroupResult, ChunkItem, ChunkableModule, ChunkableModules, ChunkingContext,
         EntryChunkGroupResult, EvaluatableAssets, MinifyType, ModuleId,
     },
     environment::Environment,
@@ -389,22 +389,33 @@ impl ChunkingContext for BrowserChunkingContext {
     }
 
     #[turbo_tasks::function]
-    async fn chunk_group(
-        self: ResolvedVc<Self>,
+    fn chunk_group(
+        self: Vc<Self>,
         ident: Vc<AssetIdent>,
         module: ResolvedVc<Box<dyn ChunkableModule>>,
+        availability_info: Value<AvailabilityInfo>,
+    ) -> Vc<ChunkGroupResult> {
+        self.chunk_group_multiple(ident, Vc::cell(vec![module]), availability_info)
+    }
+
+    #[turbo_tasks::function]
+    async fn chunk_group_multiple(
+        self: ResolvedVc<Self>,
+        ident: Vc<AssetIdent>,
+        modules: Vc<ChunkableModules>,
         availability_info: Value<AvailabilityInfo>,
     ) -> Result<Vc<ChunkGroupResult>> {
         let span = tracing::info_span!("chunking", ident = ident.to_string().await?.to_string());
         async move {
             let this = self.await?;
+            let modules = modules.await?;
             let input_availability_info = availability_info.into_value();
             let MakeChunkGroupResult {
                 chunks,
                 availability_info,
             } = make_chunk_group(
                 ResolvedVc::upcast(self),
-                [ResolvedVc::upcast(module)],
+                modules.iter().copied().map(ResolvedVc::upcast),
                 input_availability_info,
             )
             .await?;
